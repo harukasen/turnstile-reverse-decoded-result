@@ -1,345 +1,270 @@
-# Cloudflare Turnstile / Managed Challenge VM — Decompiled Architecture Specification
+# Cloudflare Challenge VM — Decompiled Architecture Notes
 
-This repository contains the complete, high-fidelity reverse-engineered and decompiled JavaScript implementations of Cloudflare Turnstile's virtual machine (VM) bytecode routines.
+> **Research notice:** This repository contains analysis of client-side JavaScript observed during authorized research. It is not affiliated with, endorsed by, or sponsored by Cloudflare. Do not use these materials to bypass access controls, evade bot protections, collect user data, or interfere with services. Remove or redact any session IDs, tokens, URLs, and environment-specific values before publishing.
 
-The codebase is partitioned into three core operational stages:
-1. **[`response1.js`](https://github.com/harukasen/turnstile-reverse-decoded-result/blob/main/response1.js)**: Main Challenge Evaluation Engine (1,468 instructions, 23 closures).
-2. **[`response2.js`](https://github.com/harukasen/turnstile-reverse-decoded-result/blob/main/response2.js)**: Challenge Completion, Token Packaging & Cross-Frame Delivery (99 instructions, 3 closures).
-3. **[`decompiled2.js`](https://github.com/harukasen/turnstile-reverse-decoded-result/blob/main/prerunprogram-vm-int.js)**: Deep Client Environment, Hardware & DOM Anti-Tamper Probing (735 instructions, 19 functions).
+## Overview
 
----
+This repository documents a reverse-engineering/decompilation effort involving three related JavaScript components:
 
-## 1. Executive Summary & Challenge Lifecycle Flow
+1. [**`response1.js`**](https://github.com/harukasen/turnstile-reverse-decoded-result/blob/main/response1.js) — Challenge evaluation and task orchestration.
 
-Cloudflare Turnstile executes client-side validation as a multi-tier pipeline inside a custom register-based JavaScript virtual machine. The execution lifecycle proceeds sequentially across three discrete phases:
+1. [**`response2.js`**](https://github.com/harukasen/turnstile-reverse-decoded-result/blob/main/response2.js) — Completion handling, token lifecycle, and cross-frame messaging.
+
+1. [**`prerunprogram-vm-int.js`**](https://github.com/harukasen/turnstile-reverse-decoded-result/blob/main/prerunprogram-vm-int.js) — Environment, hardware, DOM, and anti-tamper probes. The source is referred to as `decompiled2.js` in some notes.
+
+The instruction and closure counts below are observations from the analyzed artifacts and may change between deployments. They should not be treated as stable Cloudflare implementation details.
+
+## Contents
+
+- [Architecture](#architecture)
+
+- [`response1.js`](#response1js)
+  - [Transformation and digest helpers](#transformation-and-digest-helpers)
+  - [DOM isolation and error handling](#dom-isolation-and-error-handling)
+  - [Task pipeline](#task-pipeline)
+  - [Beacon finalization](#beacon-finalization)
+  - [Runtime state](#runtime-state)
+
+- [`response2.js`](#response2js)
+
+- [`prerunprogram-vm-int.js`](#prerunprogram-vm-intjs)
+
+- [Shared state](#shared-state)
+
+- [Limitations](#limitations)
+
+- [Responsible disclosure](#responsible-disclosure)
+
+## Architecture
+
+The analyzed code appears to implement a three-phase client-side pipeline:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Parent as Parent Frame / Host Page
-    participant Widget as Turnstile Iframe Container
-    participant VM1 as Decompiled Prober (decompiled2.js)
-    participant Engine as Challenge Engine (response1.js)
-    participant Worker as Dedicated Web Worker (Trusted Types)
-    participant CF as Cloudflare Challenge Edge Server
+    participant Parent as Host page
+    participant Widget as Challenge frame
+    participant Probe as Environment probe
+    participant Engine as Challenge engine
+    participant Worker as Web Worker
+    participant Edge as Challenge service
 
-    Note over Widget,VM1: Phase 1: Environment & Anti-Tamper Probing
-    VM1->>Widget: Inject Proxy traps on querySelector & querySelectorAll
-    VM1->>Widget: Inspect WebGPU, WebRTC STUN candidates, BroadcastChannel
-    VM1->>Widget: Compare clean iframe eval.toString() vs window.eval.toString()
-    VM1->>Widget: Record benchmark timing & anti-automation metrics in _cf_chl_opt
+    Note over Widget,Probe: Phase 1 — environment and integrity probes
+    Probe->>Widget: Inspect browser APIs and DOM behavior
+    Probe->>Widget: Record timing and compatibility observations
 
-    Note over Widget,Engine: Phase 2: Challenge Evaluation Engine
-    Engine->>Widget: Register window 'unhandledrejection' & 'error' interceptors
-    Engine->>Widget: Probe DOM tree, shadow DOM mode, compareDocumentPosition
-    Engine->>Worker: Spawn sandboxed Worker under 'nAZtB7' Trusted Types policy
-    Engine->>Engine: Run task pipeline with Promise.race & timeout enforcement
-    Engine->>CF: Dispatch final state beacon to /cdn-cgi/challenge-platform/h/...
+    Note over Widget,Engine: Phase 2 — challenge evaluation
+    Engine->>Widget: Install error and rejection handlers
+    Engine->>Widget: Run dynamic tasks with timeouts
+    Engine->>Worker: Execute isolated worker operations
+    Engine->>Edge: Send an evaluation result
 
-    Note over Widget,Parent: Phase 3: Token Finalization & Delivery
-    CF-->>Widget: Return signed Challenge Tokens (response2.js)
-    Widget->>Parent: postMessage({ event: "complete", token, scs, chlId })
-    Widget->>Widget: Schedule token expiration timer (QpGcn6)
-    Widget->>Parent: postMessage({ event: "tokenExpired", token })
-    Widget->>Widget: Run post-expiration cleanup hooks (BfdZR2.Idud0, OzXf9)
+    Note over Widget,Parent: Phase 3 — completion and expiration
+    Edge-->>Widget: Return a challenge result
+    Widget->>Parent: postMessage completion event
+    Widget->>Widget: Schedule expiration and cleanup
+    Widget->>Parent: postMessage expiration event
 ```
 
----
+## `response1.js`
 
-## 2. In-Depth Technical Specification: `response1.js`
+`response1.js` appears to coordinate environment fingerprinting, worker isolation, dynamic task execution, timeout handling, and result transmission.
 
-**Challenge Session ID**: `a482088fff093c13`  
+### Transformation and digest helpers
 
-`response1.js` orchestrates environment fingerprinting, sandboxed worker isolation, dynamic task execution, and result beacon dispatch.
+- **`byteToHex`** — Converts an 8-bit value to a two-character hexadecimal string.
 
-### 2.1 Cryptographic & String Transformation Primitives
-- **`byteToHex(b)` (Closure `0x03D6`)**:
-  Converts an 8-bit unsigned integer into a padded 2-character hexadecimal representation (`b.toString(16).padStart(2, "0")`).
-- **`hashBufferToHex(buffer)` (Closure `0x041B`)**:
-  Converts an `ArrayBuffer` or `Uint8Array` digest into a continuous hex string.
-- **`decipherString(str, key)` (Closures `0x009F`, `0x00F3`, `0x019E`)**:
-  Decodes length-prefixed and packed strings stored in bytecode buffers. Parses 2-byte/4-byte headers (e.g., `\0\u{2}[]`, `\0\u{1}0`) and performs modular character shift XOR arithmetic:
-  $$\text{output}[i] = (\text{code}[i] \ \& \ 255) \oplus ((key + i) \ \& \ 255)$$
-- **`sha256Digest(data)` (Closure `0x0488`)**:
-  Computes SHA-256 digests via standard `window.crypto.subtle.digest("SHA-256", buffer)`. If SubtleCrypto is unavailable or blocked, falls back to the proprietary software digest routine `window.yMNq4(data)`.
+- **`hashBufferToHex`** — Converts an `ArrayBuffer` or `Uint8Array` digest to a hexadecimal string.
 
-### 2.2 DOM Isolation & Error Handling
-- **`createHiddenIframe()` (Closure `0x0298`)**:
-  Creates an invisible `0px x 0px` sandboxed iframe (`sandbox="allow-same-origin"`, `visibility: hidden; border: none; position: absolute; top: 0; left: 0`). Injected directly into the Turnstile element container `chlOpt.gNoox7` (or `document.body`).
-- **`onUnhandledRejection(event)` (Closure `0x058C`)**:
-  - Intercepts promise rejections and calls `event.preventDefault()`.
-  - Extracts debug metadata via `chlOpt.PvgAG6.QUAMj1()`.
-  - Appends rejection reason to `chlOpt.PvgAG6.rqvo8`.
-  - Dispatches diagnostic telemetry to Cloudflare via `window.PfTN4(reason, "Opay4", chlOpt.kQOwR1)`.
-- **`onWindowError(event, stateBag)` (Closure `0x073C`)**:
-  - Immediately revokes active object URLs (`URL.revokeObjectURL(stateBag.MUXdN7)`) and terminates the background Web Worker (`stateBag.Xhlo9.terminate()`).
-  - Filters out generic `"script error"` cross-origin notifications.
-  - Sets the global health flag `window.PmusQ9 = false`.
-  - Collects stack telemetry into `{ GekQc8: event.message, zuEb9: event.filename, JxYV7: event.lineno, CIIio0: event.colno, wCgii9: event.error }`.
-  - Dispatches incident beacon via `window.PfTN4(payload, "aZhEf7", chlOpt.kQOwR1)`.
-  - Attaches `error.QYNe4 = true` and re-throws the exception.
+- **`decipherString`** — Decodes length-prefixed or packed strings embedded in bytecode buffers. The observed transformation includes modular character shifts and XOR operations.
 
-### 2.3 Challenge Task Pipeline
-The challenge task queue (`taskQueue`) executes dynamic probe tasks in parallel with strict per-task timeout enforcement:
+- **`sha256Digest`** — Uses `crypto.subtle.digest("SHA-256", ...)` when available and appears to fall back to an internal digest routine otherwise.
 
-| Closure | Routine | Purpose / Operational Behavior |
-| :--- | :--- | :--- |
-| `0xDE95` | `wrapResult(task, val)` | Encapsulates task output into `{ svEtd6: task.svEtd6, eOgrn0: val }`. |
-| `0xDECB` | `wrapSuccessFlag(task)` | Emits success indicator `{ svEtd6: task.svEtd6, bQjGu7: true }`. |
-| `0xDF05` | `onTaskTimeout(task, res)` | Executes timeout callback `task.veJRU5.call()`. On error, triggers cipher fallback `window.SkQox7(CIPHER_PAYLOAD_5)`. Resolves `{ svEtd6, ChRE0: true, eOgrn0: undefined }`. |
-| `0xE01C` | `scheduleTaskTimeout(...)` | Wrapper for `window.setTimeout(onTaskTimeout, timeoutMs)`. |
-| `0xE05F` | `clearTaskTimeout(...)` | Wrapper for `window.clearTimeout(timerId)`. |
-| `0xE08A` | `executeChallengeTask(task)` | Computes timeout bound from `task.dndff2` or `Math.max(0, 2000 - (Date.now() - task.cmqLa9))`. Executes `Promise.race([taskPromise, timeoutPromise])`. |
-| `0xE1EB` | `mirrorProperty(tgt, src, p)` | Copies property descriptor using `Object.getOwnPropertyDescriptor` and `Object.defineProperty`. |
-| `0xE25A` | `onAllTasksResolved(res)` | Aggregates results: sets `target.telu1 = true` on success, mirrors returned objects, sets `target.qqin0 = true` on timeout, and decrypts verification tokens (`CIPHER_PAYLOAD_1` through `CIPHER_PAYLOAD_4`). |
-| `0xE68D` | `onTasksError(err)` | Handles rejection in the task batch by invoking fallback `window.SkQox7(CIPHER_PAYLOAD_2)`. |
-| `0xE710` | `onTasksFinally(...)` | Records total duration `stateBag.VPlfa6 = Date.now() - startTime`, drains `taskQueue.length = 0`, and executes beacon transmission. |
+> Do not publish captured ciphertext, session-specific keys, signed tokens, or live challenge payloads. They are deployment-specific and may be security-sensitive.
 
-### 2.4 Beacon Construction & Finalization (`0xD840`)
-1. **Worker Disposal**: Calls `URL.revokeObjectURL` on `stateBag.MUXdN7` and `.terminate()` on `stateBag.Xhlo9`.
-2. **State Cleanup**: Resets `stateBag.QtLXm2 = ""`.
-3. **Endpoint Construction**:
-   $$\text{URL} = \text{BEACON\_BASE} + \text{"/h/"} + (\text{chlOpt.DuPd9} \ || \ \text{""}) + \text{BEACON\_PATH}$$
-   Where `BEACON_BASE` is `"/cdn-cgi/challenge-platform"` and `BEACON_PATH` contains the challenge session ID (`385944947:1791594335:.../a482088fff093c13/...`).
-4. **Transport Strategy**: Transmits payload via `window.SkQox7` if available, falling back to `window.fetch` (`POST, application/json`) or `navigator.sendBeacon`.
+### DOM isolation and error handling
 
-### 2.5 State Dictionary & DOM Inspection (`0x6535E` & `0x35A22`)
-The runtime state bag (`stateBag`) records over 40 distinct browser and configuration parameters:
+- **Hidden iframe creation** — Creates a zero-sized, hidden iframe with a restricted sandbox configuration for isolated checks.
 
-| State Key | Source Expression / Origin | Description |
-| :--- | :--- | :--- |
-| `hYPXy0` | `chlOpt.aUlu1` | Internal challenge mode token |
-| `KimyV3` | `chlOpt.KimyV3` | Primary challenge session identifier |
-| `XamU2` | `chlOpt.XamU2` | Widget rendering configuration |
-| `CRAW0` | `"oWrxl6"` | Static VM handler signature |
-| `NKjo6` | `chlOpt.oCmIf9 - chlOpt.NbNuk0` | Server-to-client timestamp synchronization delta |
-| `DofrX3` | `chlOpt.TGLE6 - chlOpt.HglSP8` | Execution latency delta 1 |
-| `eOkZH7` | `chlOpt.TGLE6 - chlOpt.HglSP8` | Execution latency delta 2 |
-| `iDbd1` – `apSMs6` | `chlOpt[prop]` | Core feature flags (`CsJSj9`, `vhKyy7`, `AccaH6`, `pcFOG3`, `JJcr4`, etc.) |
-| `uEkj3` | `chlOpt.PgGRd4 - chlOpt.ydrIB0` | Internal script parsing delay delta |
-| `KweJ1` | `window.iaNL2()` | Dynamic runtime checksum |
-| `bQWwB7` | `body.shadowRoot && mode === "closed"` | Verification that Turnstile container shadow DOM is closed |
-| `vvZW7` / `hzxxI7` | `compareDocumentPosition` flag | Node hierarchy verification between `head`, `body`, and container elements |
-| `UFlzi7` | `JSON.stringify(domMetrics)` | 8-element array recording shadow DOM mode, HTML length, and attachShadow stringification |
-| `MUXdN7` | `URL.createObjectURL(blob)` | Blob URL for Trusted Types Web Worker |
-| `Xhlo9` | `new Worker(workerUrl)` | Dedicated background worker instance |
-| `ikWJl0` | `sha256Digest` | Worker cryptographic message digest routine |
-| `bLwNX7` | `JSON.parse("[]")` | Deserialized task list |
-| `bLVb2` / `Pqyt7` | Decrypted ciphertext buffers | Dynamic challenge runtime configurations |
-| `QgLe6` | `JSON.parse("0")` | Task queue index pointer |
-| `jIdZ4` | Decrypted ciphertext buffer | Encrypted instruction block |
-| `VPlfa6` | `Date.now() - startTime` | Execution runtime total (milliseconds) |
+- **Unhandled-rejection handling** — Intercepts promise rejections, records diagnostic data, and forwards telemetry through an internal reporting function.
 
----
+- **Window-error handling** — Releases worker resources and object URLs, records error metadata, updates a health flag, and reports the incident.
 
-## 3. In-Depth Technical Specification: `response2.js`
+The exact names of internal properties and reporting functions are deployment-specific obfuscation artifacts and should not be assumed to be stable APIs.
 
-**File**: [`response2.js`] 
-(99 instructions)  
-**Challenge Session ID**: `a482088fff093c13`  
+### Task pipeline
 
-`response2.js` handles the completion of the challenge, transmitting the cryptographic Turnstile verification clearance token to the host embedding page and managing token expiration lifecycles.
+The observed task queue runs dynamic probe tasks with per-task timeout enforcement:
 
-### 3.1 Verification Tokens & Signatures
-- **`TOKEN`**: 684-character cryptographic signed challenge clearance token (`1.SXMVe1i9fbYjCIodxGYMem...9fac66e51c68fb67ae6e914b2603dc540d8d216897a91bb2fce791c4a1af3a7e`).
-- **`SCS`**: Secondary challenge signature (`scs.1.uVjgn4ogBs8ncZAO7ZTS...`).
-- **`CHL_ID`**: Target challenge session ID (`a482088fff093c13`).
+| Closure | Routine | Observed behavior |
+| --- | --- | --- |
+| `0xDE95` | `wrapResult(task, value)` | Associates a task identifier with its result. |
+| `0xDECB` | `wrapSuccessFlag(task)` | Emits a task success indicator. |
+| `0xDF05` | `onTaskTimeout(task, result)` | Invokes timeout handling and returns a timeout result. |
+| `0xE01C` | `scheduleTaskTimeout(...)` | Wraps `setTimeout`. |
+| `0xE05F` | `clearTaskTimeout(...)` | Wraps `clearTimeout`. |
+| `0xE08A` | `executeChallengeTask(task)` | Races task execution against a timeout promise. |
+| `0xE1EB` | `mirrorProperty(target, source, property)` | Copies a property descriptor. |
+| `0xE25A` | `onAllTasksResolved(result)` | Aggregates task results and updates shared state. |
+| `0xE68D` | `onTasksError(error)` | Handles batch-level task failure. |
+| `0xE710` | `onTasksFinally(...)` | Records duration, clears the queue, and initiates finalization. |
 
-### 3.2 Functions & Lifecycle Closures
+### Beacon finalization
 
-#### 1. `onExpirationCleanup()` (Closure `0x00C7`)
-Invoked 1,000ms after the token expires. Triggers internal challenge teardown:
+The finalization path appears to:
+
+1. Revoke a worker object URL and terminate the worker.
+
+1. Clear transient state.
+
+1. Construct a challenge-platform endpoint from runtime configuration.
+
+1. Send a result using an internal transport helper, `fetch`, or `navigator.sendBeacon`, depending on availability.
+
+The endpoint, path, payload, and session identifiers vary by deployment. Keep them out of public documentation unless they are already public and non-sensitive.
+
+### Runtime state
+
+The runtime state bag contains browser observations, feature flags, timing values, worker references, and task data. Representative fields include:
+
+| Field | Observed source | Purpose |
+| --- | --- | --- |
+| `hYPXy0` | Challenge configuration | Internal mode value. |
+| `KimyV3` | Challenge configuration | Session-related identifier. |
+| `XamU2` | Challenge configuration | Widget configuration. |
+| `NKjo6` | Timestamp difference | Clock synchronization delta. |
+| `DofrX3`, `eOkZH7` | Timestamp differences | Execution-latency measurements. |
+| `KweJ1` | Runtime helper | Dynamic runtime checksum or probe result. |
+| `bQWwB7` | Shadow DOM inspection | Closed-shadow-root observation. |
+| `vvZW7`, `hzxxI7` | `compareDocumentPosition` | DOM hierarchy observations. |
+| `UFlzi7` | Serialized DOM metrics | DOM structure and rendering observations. |
+| `MUXdN7` | `URL.createObjectURL` | Worker blob URL. |
+| `Xhlo9` | `new Worker(...)` | Worker instance. |
+| `VPlfa6` | Elapsed time | Total pipeline duration in milliseconds. |
+
+## `response2.js`
+
+`response2.js` appears to manage challenge completion, parent-frame messaging, token expiration, and cleanup.
+
+### Completion lifecycle
+
+The observed lifecycle is:
+
+1. Mark completion state in the local runtime.
+
+1. Notify internal controllers.
+
+1. Send a completion message to the parent frame.
+
+1. Schedule expiration using a runtime-provided delay.
+
+1. Send a single expiration message when the lifetime ends.
+
+1. Run cleanup callbacks after a short grace period.
+
+A representative, redacted message shape is:
+
 ```javascript
-function onExpirationCleanup() {
-    if (BfdZR2) {
-        if (typeof BfdZR2["Idud0"] === "function") BfdZR2["Idud0"]();
-        if (typeof BfdZR2["OzXf9"] === "function") BfdZR2["OzXf9"]();
-    }
-}
+window.parent.postMessage(
+  {
+    source: "cloudflare-challenge",
+    widgetId: "<redacted-widget-id>",
+    event: "complete",
+    token: "<redacted-token>",
+    scs: "<redacted-signature>",
+    chlId: "<redacted-challenge-id>"
+  },
+  "*"
+);
 ```
 
-#### 2. `onChallengeComplete()` (Closure `0x04CC`)
-The master completion handler:
-- Tracks expiration state via local closure flag `tokenExpiredDispatched = false`.
-- Sets global completion flags:
-  ```javascript
-  window["heZSi1"] = true;
-  window["HKLPs9"] = true;
-  ```
-- Signals internal controllers:
-  ```javascript
-  BfdZR2["pGgJK8"]();
-  BfdZR2["RZEd5"]();
-  ```
-- Dispatches the `complete` event to the parent window via `window.parent.postMessage`:
-  ```javascript
-  parent.postMessage({
-      source: "cloudflare-challenge",
-      widgetId: chlOpt["tSMA8"],
-      event: "complete",
-      token: TOKEN,
-      scs: SCS,
-      chlId: CHL_ID
-  }, "*");
-  ```
-- Schedules token expiration using the delay specified in `chlOpt["QpGcn6"]`.
+The expiration message omits completion-only fields and uses `event: "tokenExpired"`.
 
-#### 3. `onTokenExpired()` (Closure `0x0102`)
-Fires when the verification token reaches its lifetime limit:
-- Prevents duplicate dispatches via `tokenExpiredDispatched` guard.
-- Posts `tokenExpired` event to the parent window:
-  ```javascript
-  parent.postMessage({
-      source: "cloudflare-challenge",
-      widgetId: chlOpt["tSMA8"],
-      event: "tokenExpired",
-      token: TOKEN
-  }, "*");
-  ```
-- Schedules `onExpirationCleanup` after a 1-second grace window (`window.setTimeout(onExpirationCleanup, 1000)`).
+### Cleanup
 
-#### 4. Auto-Execution Hook
-Registers the entry point on the global object and triggers immediately if readiness flags are pre-set:
-```javascript
-window["fHkz0"] = onChallengeComplete;
-if (window["heZSi1"]) {
-    window["fHkz0"]();
-}
-```
+The expiration cleanup routine invokes available teardown callbacks after a one-second grace period. The exact callback names are obfuscated and can change between builds.
 
----
+## `prerunprogram-vm-int.js`
 
-## 4. In-Depth Technical Specification: `decompiled2.js`
-
-**File**: [`decompiled2.js`]
-**Bytecode Source**: (735 instructions across 19 functions)  
-**Target Capabilities**: WebRTC, WebGPU, BroadcastChannel, Proxy DOM Traps, ReDoS Timing  
-
-`decompiled2.js` is the deep environment and bot-detection prober executed prior to or alongside the challenge engine to detect headless browsers, automation frameworks (Puppeteer, Playwright, Selenium), and monkey-patched APIs.
-
-### 4.1 Anti-Tamper & Environment Probing Architecture
+The file referred to as `decompiled2.js` in the original notes appears to perform browser-environment and anti-tamper probes. The following list describes observed behavior, not a guarantee of current production behavior.
 
 ```mermaid
 flowchart TD
-    Start["mainOrchestrator() Execution"] --> Step1["Step 1: Dynamic XOR Decipher (ulgk5)"]
-    Step1 --> Step2["Step 2: toJSON Hook Serialization Probe"]
-    Step2 --> Step3["Step 3: WebGPU Adapter Inspection"]
-    Step3 --> Step4["Step 4: WebRTC STUN Gathering & Candidate Harvesting"]
-    Step4 --> Step5["Step 5: eval.toString() Clean Iframe Comparison"]
-    Step5 --> Step6["Step 6: ReDoS & Regex Engine Performance Benchmark"]
-    Step6 --> Step7["Step 7: Angular Testability Mock Injection"]
-    Step7 --> Step8["Step 8: Proxy Traps on Document/Element querySelector"]
-    Step8 --> Step9["Step 9: Non-configurable Traps on window.frameElement"]
-    Step9 --> Step10["Step 10: BroadcastChannel Inter-Context Handshake"]
-    Step10 --> End["Environment Probing Complete"]
+    Start["Orchestrator starts"] --> A["Decode embedded data"]
+    A --> B["Probe serialization behavior"]
+    B --> C["Inspect WebGPU"]
+    C --> D["Gather WebRTC observations"]
+    D --> E["Compare eval stringification"]
+    E --> F["Measure regex timing"]
+    F --> G["Inspect testability hooks"]
+    G --> H["Proxy DOM query methods"]
+    H --> I["Inspect window properties"]
+    I --> J["Perform BroadcastChannel handshake"]
+    J --> End["Finish environment probes"]
 ```
 
-### 4.2 Probing Modules & Detection Mechanisms
+### Observed probe categories
 
-#### Step 1: Dynamic XOR Decipher Routine Injection (`0x0A67 - 0x0B65`)
-Dynamically constructs an XOR deciphering function via `eval`:
-```javascript
-function ulgk5(s) {
-    return function(k) {
-        for (var o = new Uint8Array(k.length), i = 0; i < k.length; i++)
-            o[i] = k[i] ^ s.charCodeAt(i % s.length);
-        return o;
-    };
-}
-```
-Instantiated with static key `"gMSbwOXgRQvbSbxg"` into `_cf_chl_opt["ULcl2"]`.
+1. **Dynamic decoding** — Builds an XOR-based decoder and stores it in challenge configuration.
 
-#### Step 2: Custom `toJSON` Serialization Hook (`0x009B`, `0x0B69`)
-Injects an object with a custom `.toJSON()` method returning `"dKWN3"` into `_cf_chl_opt.yaqE6`. When JSON serialization occurs, this reveals whether standard serialization semantics have been altered.
+1. **Serialization behavior** — Adds an object with a custom `toJSON()` method to observe serialization semantics.
 
-#### Step 3: WebGPU Hardware Fingerprinting (`0x0BBB - 0x0CC3`)
-Inspects `navigator.gpu`:
-- Calls `navigator.gpu.requestAdapter()`.
-- Captures adapter features and hardware vendor info to detect software rendering or headless instances.
-- Errors are redirected to `_cf_chl_opt["SypY9"]`.
+1. **WebGPU inspection** — Requests an adapter and records supported features or errors when the API is available.
 
-#### Step 4: WebRTC STUN Discovery & Candidate Harvesting (`0x00CF - 0x032B`, `0x0CC3`)
-Creates an `RTCPeerConnection` with 3 STUN servers:
-- `stun:stun.cloudflare.com:3478`
-- `stun:stun.l.google.com:19302`
-- `stun:stun1.l.google.com:19302`
-- Tests DataChannel creation (`pc.createDataChannel("")`).
-- Records all ICE candidate strings (`FiSsH3`) and discovery latency (`MfDC4 = Date.now() - startTime`) into `state["JzxX6"]`.
-- Generates an SDP offer with audio/video receive flags.
-- Closes the connection automatically after 5,000ms.
+1. **WebRTC inspection** — Creates a peer connection, creates a data channel, gathers ICE candidates, records timing, and closes the connection after a timeout.
 
-#### Step 5: Native `eval.toString()` Integrity Comparison (`0x032D`, `0x1050`)
-Detects monkey-patching and hook frameworks:
-1. Captures `window.eval.toString()`.
-2. Creates a clean, sandboxed iframe (`createHiddenIframe()`).
-3. Extracts `iframe.contentWindow.eval.toString()`.
-4. Compares:
-   ```javascript
-   const isEvalTampered = (nativeEvalToString !== cleanEvalToString);
-   chlOpt["eval_tampered"] = isEvalTampered;
-   ```
-5. Removes the test iframe immediately.
+1. **`eval.toString()`**** comparison** — Compares the host implementation with one obtained from an isolated iframe.
 
-#### Step 6: Regex Timing & ReDoS Benchmark (`0x045A`, `0x1110`)
-Measures JavaScript engine execution timing and regex backtracking behavior:
-- Generates a pathological string payload:
-  ```javascript
-  const testPayload = " ".repeat(1337331) + "0, /.*honk.*/, ";
-  ```
-- Evaluates engine execution time and writes elapsed milliseconds into `_cf_chl_opt["atsr5"]`.
+1. **Regex timing** — Measures execution time for a large regular-expression workload. This should not be reproduced against production systems without explicit authorization.
 
-#### Step 7: Angular Testability Mock Injection (`0x05AB - 0x05E0`, `0x11EF`)
-Mocks the Angular test framework hook `window._cf_chl_opt.angular = { getTestability: ... }`. Detects whether external testing scripts attempt to synchronize with or poll testability hooks.
+1. **Testability-hook observation** — Installs or inspects a testability-related hook.
 
-#### Step 8: DOM Query Proxy Traps (`0x05E2 - 0x0683`, `0x12B2`)
-Detects automated scraping bots and query activity:
-- Replaces native methods on `Document.prototype` and `Element.prototype` (`querySelector`, `querySelectorAll`) with a `Proxy`.
-- Any CSS selector queried by host scripts or scraper bots is captured into `_cf_chl_opt["GOxN9"]`:
-  ```javascript
-  function proxyApplyTrap(target, thisArg, argArray) {
-      if (argArray && argArray.length > 0) {
-          chlOpt["GOxN9"].push(String(argArray[0]));
-      }
-      return Reflect.apply(target, thisArg, argArray);
-  }
-  ```
-- Backs up original function pointers in `_cf_chl_opt["PREJ9"]`.
+1. **DOM query proxies** — Wraps `querySelector` and `querySelectorAll` to observe selector usage and preserve the original functions.
 
-#### Step 9: Window Property Getter Traps (`0x0685 - 0x077D`, `0x1447`)
-Configures non-configurable, non-enumerable traps on `window.frameElement`:
-- Accessing `frameElement` pushes `"frameElement"` into `_cf_chl_opt["GOxN9"]`.
-- If `Object.defineProperty` fails (e.g. if pre-hooked by an extension or headless wrapper), sets `_cf_chl_opt["dxLyU0"] = "GQpe9"`.
+1. **Window-property traps** — Attempts to define a getter or trap around `window.frameElement` and records failures.
 
-#### Step 10: BroadcastChannel Inter-Context Handshake (`0x077F - 0x083C`, `0x1595`)
-Verifies execution within a full browser context supporting cross-tab communication:
-- Opens `new BroadcastChannel("a")`.
-- Transmits `{ ping: token }` and handles bidirectional pong messages, incrementing handshake counter `_cf_chl_opt["qYSky6"]`.
+1. **BroadcastChannel handshake** — Opens a channel, exchanges a short message, and records the observed round trip.
 
----
+## Shared state
 
-## 5. Cross-Script Synergy & Shared State Reference Matrix
+The analyzed scripts appear to exchange data through a shared challenge configuration object, commonly represented as `window._cf_chl_opt` in the decompiled output.
 
-The table below documents how runtime data flows between `decompiled2.js`, `response1.js`, and `response2.js` through `window._cf_chl_opt`:
+| Property | Writer | Reader | Observed role |
+| --- | --- | --- | --- |
+| `KimyV3` | Host/runtime | Probe, engine | Session-related value. |
+| `gNoox7` | Host/widget | Probe, engine | Widget container reference. |
+| `GOxN9` | Probe | Engine | Observed selector/property accesses. |
+| `dxLyU0` | Probe | Engine | Hook-integrity status. |
+| `atsr5` | Probe | Engine | Regex timing observation. |
+| `igenI1` | Probe | Engine | WebGPU result. |
+| `dSkYd9` | Probe | Engine | WebRTC result. |
+| `qYSky6` | Probe | Engine | BroadcastChannel counter. |
+| `PmusQ9` | Engine | Runtime | Script health indicator. |
+| `MUXdN7` | Engine | Finalizer | Worker object URL. |
+| `Xhlo9` | Engine | Finalizer | Worker instance. |
+| `UFlzi7` | Engine | Edge service | Serialized DOM metrics. |
+| `VPlfa6` | Engine | Edge service | Total execution time. |
+| `tSMA8` | Host/widget | Completion handler | Widget identifier. |
+| `heZSi1` | Completion handler | Runtime | Completion state. |
+| `HKLPs9` | Completion handler | Runtime | Validation state. |
+| `QpGcn6` | Runtime | Completion handler | Token lifetime. |
 
-| Property Key | Writer Script | Reader Script | Functional Role |
-| :--- | :--- | :--- | :--- |
-| `KimyV3` | Host / Server Injection | `decompiled2.js`, `response1.js` | Challenge session token for BroadcastChannel & beacon identification |
-| `gNoox7` | Host Widget Host | `response1.js`, `decompiled2.js` | Turnstile container DOM element |
-| `GOxN9` | `decompiled2.js` (Proxy) | `response1.js` | Log of scraper CSS queries and `frameElement` inspections |
-| `dxLyU0` | `decompiled2.js` (Traps) | `response1.js` | Property hook integrity status flag |
-| `atsr5` | `decompiled2.js` (Benchmark)| `response1.js` | Regex engine execution time benchmark |
-| `igenI1` | `decompiled2.js` (WebGPU) | `response1.js` | WebGPU adapter hardware inspection object |
-| `dSkYd9` | `decompiled2.js` (WebRTC) | `response1.js` | WebRTC peer connection state & harvested ICE candidates |
-| `qYSky6` | `decompiled2.js` (BC) | `response1.js` | BroadcastChannel roundtrip message counter |
-| `PmusQ9` | `response1.js` (Init/Error) | Host Environment | Script health status indicator (`true` = healthy, `false` = error) |
-| `MUXdN7` | `response1.js` (Worker) | `response1.js` (Finalizer) | Trusted Types Web Worker blob URL (revoked upon completion) |
-| `Xhlo9` | `response1.js` (Worker) | `response1.js` (Finalizer) | Web Worker instance thread (terminated upon completion) |
-| `UFlzi7` | `response1.js` (Fingerprint) | Edge Beacon Server | Serialized 8-element DOM structure metrics payload |
-| `VPlfa6` | `response1.js` (Finally) | Edge Beacon Server | Total challenge pipeline runtime in milliseconds |
-| `tSMA8` | Host Widget Host | `response2.js` | Turnstile widget instance identifier for `postMessage` |
-| `heZSi1` | `response2.js` (Completion) | Host / Turnstile Runtime | Challenge complete readiness indicator |
-| `HKLPs9` | `response2.js` (Completion) | Host / Turnstile Runtime | Challenge validation success indicator |
-| `QpGcn6` | Server Injection | `response2.js` | Verification token validity duration in milliseconds |
+## Limitations
 
----
+- Obfuscated property names, closure offsets, instruction counts, endpoints, and payload formats are build-specific.
 
+- Decompilation can misrepresent control flow, inferred names, or asynchronous behavior.
+
+- Browser APIs differ across engines, versions, privacy settings, and extensions.
+
+- The notes do not establish that every observed behavior is present in current production deployments.
+
+- Never commit live tokens, cookies, private keys, session identifiers, or personal data. Use placeholders such as `<redacted-token>`.
+
+## Responsible disclosure
+
+If analysis reveals a security vulnerability or an unintended privacy issue, stop testing, preserve only the minimum evidence necessary, and report it through the vendor's official security-reporting channel. Do not publish exploit instructions or sensitive artifacts before coordinated disclosure.
+
+## License and provenance
+
+Add the project's actual license and provenance information here. If the code was generated from third-party artifacts, document the source, permissions, and applicable redistribution terms before publishing.
